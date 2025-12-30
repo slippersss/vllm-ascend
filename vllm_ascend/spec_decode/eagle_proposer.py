@@ -614,7 +614,7 @@ class EagleProposer(VllmEagleProposer):
         if self.num_speculative_tokens == 1:
             draft_token_ids = logits.argmax(dim=-1)
             return draft_token_ids.view(-1, 1)
-        # --------------------------------------------------------------------#
+        # ------------------------------------------------------------------- #
 
         if self.uses_mrope:
             positions = target_positions[:, last_token_indices]
@@ -748,8 +748,8 @@ class EagleProposer(VllmEagleProposer):
             common_attn_metadata.seq_lens += 1
             # For the requests that exceed the max model length, we set the
             # sequence length to 1 to minimize their overheads in attention.
-            common_attn_metadata.seq_lens.masked_fill_(exceeds_max_model_len,
-                                                       1)
+            common_attn_metadata.seq_lens[:batch_size].masked_fill_(
+                exceeds_max_model_len, 1)
 
             # TODO: what aboue max_seq_len
             common_attn_metadata.seq_lens_cpu = (

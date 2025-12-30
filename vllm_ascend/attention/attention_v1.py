@@ -265,7 +265,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
     ):
 
         if attn_state in (AscendAttentionState.DecodeOnly,
-                          AscendAttentionState.ChunkedPrefill):
+                          AscendAttentionState.SpecDecoding):
             attn_metadata = self.build(
                 common_prefix_len=0,
                 common_attn_metadata=common_attn_metadata,
