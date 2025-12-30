@@ -665,8 +665,8 @@ class EagleProposer(VllmEagleProposer):
             common_attn_metadata.seq_lens += 1
             # For the requests that exceed the max model length, we set the
             # sequence length to 1 to minimize their overheads in attention.
-            common_attn_metadata.seq_lens.masked_fill_(exceeds_max_model_len,
-                                                       1)
+            common_attn_metadata.seq_lens[:batch_size].masked_fill_(
+                exceeds_max_model_len, 1)
 
             # TODO: what aboue max_seq_len
             common_attn_metadata.seq_lens_cpu = (
