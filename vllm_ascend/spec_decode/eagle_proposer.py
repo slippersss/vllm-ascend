@@ -686,17 +686,21 @@ class EagleProposer(VllmEagleProposer):
                 dim=1, index=block_numbers.view(-1, 1))
             block_ids = block_ids.view(-1)
             if self.uses_mrope:
-                common_attn_metadata.slot_mapping = (
+                slot_mapping = (
                     block_ids * block_size +
-                    clamped_positions[0] % block_size).to(torch.int32)
+                    clamped_positions[0] % block_size)
             else:
-                common_attn_metadata.slot_mapping = (
+                slot_mapping = (
                     block_ids * block_size +
-                    clamped_positions % block_size).to(torch.int32)
+                    clamped_positions % block_size)
+            common_attn_metadata.slot_mapping[:slot_mapping.shape[0]].copy_(
+                slot_mapping.to(torch.int32))
+            common_attn_metadata.slot_mapping[slot_mapping.shape[0]:].fill_(
+                PADDING_SLOT_ID)
             # Mask out the slot mappings that exceed the max model length.
             # Otherwise, the KV cache will be inadvertently updated with the
             # padding tokens.
-            common_attn_metadata.slot_mapping.masked_fill_(
+            common_attn_metadata.slot_mapping[:batch_size].masked_fill_(
                 exceeds_max_model_len, PADDING_SLOT_ID)
             """
             a large amount of code for pcpdcp attention metadata update
