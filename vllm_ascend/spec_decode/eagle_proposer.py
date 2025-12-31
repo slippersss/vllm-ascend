@@ -698,9 +698,16 @@ class EagleProposer(VllmEagleProposer):
 
         common_attn_metadata.num_actual_tokens = batch_size
         common_attn_metadata.max_query_len = 1
-        common_attn_metadata.query_start_loc = self.arange[:batch_size + 1]
-        common_attn_metadata.query_start_loc_cpu = torch.from_numpy(
-            self.token_arange_np[:batch_size + 1]).clone()
+        if aclgraph_runtime_mode == CUDAGraphMode.FULL:
+            common_attn_metadata.block_table_tensor = common_attn_metadata.backup["block_table_tensor"][:input_batch_size]
+            common_attn_metadata.num_reqs = input_batch_size
+            common_attn_metadata.query_start_loc = self.arange[:input_batch_size + 1]
+            common_attn_metadata.query_start_loc_cpu = torch.from_numpy(
+                self.token_arange_np[:input_batch_size + 1]).clone()
+        else:
+            common_attn_metadata.query_start_loc = self.arange[:batch_size + 1]
+            common_attn_metadata.query_start_loc_cpu = torch.from_numpy(
+                self.token_arange_np[:batch_size + 1]).clone()
 
         common_attn_metadata.decode_token_per_req = 1  # TODO: check it
         common_attn_metadata.attn_mask = (
@@ -1124,7 +1131,8 @@ class EagleProposer(VllmEagleProposer):
             num_computed_tokens_cpu=common_attn_metadata.
             num_computed_tokens_cpu,
             seq_lens=common_attn_metadata.seq_lens,
-            max_seq_len=0)
+            max_seq_len=0,
+            backup=common_attn_metadata.backup)
 
         query_start_loc = common_attn_metadata.query_start_loc[
             1:1 + num_rejected_tokens_gpu.shape[0]]
