@@ -618,6 +618,8 @@ class EagleProposer(VllmEagleProposer):
         if aclgraph_runtime_mode == CUDAGraphMode.FULL:
             common_attn_metadata.block_table_tensor = common_attn_metadata.backup["block_table_tensor"][:input_batch_size]
             common_attn_metadata.num_reqs = input_batch_size
+            common_attn_metadata.seq_lens = common_attn_metadata.backup["seq_lens"][:input_batch_size]
+            common_attn_metadata.seq_lens_cpu = common_attn_metadata.backup["seq_lens_cpu"][:input_batch_size]
             common_attn_metadata.query_start_loc = self.arange[:input_batch_size + 1]
             common_attn_metadata.query_start_loc_cpu = torch.from_numpy(
                 self.token_arange_np[:input_batch_size + 1]).clone()
@@ -669,17 +671,22 @@ class EagleProposer(VllmEagleProposer):
             # operations in case they are modified in next step's `prepare_input`
             # of main model.
             # Increment the sequence lengths.
-            common_attn_metadata.seq_lens += 1
+            common_attn_metadata.seq_lens[:batch_size] += 1
             # For the requests that exceed the max model length, we set the
             # sequence length to 1 to minimize their overheads in attention.
             common_attn_metadata.seq_lens[:batch_size].masked_fill_(
                 exceeds_max_model_len, 1)
 
             # TODO: what aboue max_seq_len
-            common_attn_metadata.seq_lens_cpu = (
-                common_attn_metadata.seq_lens_cpu + 1)
+            common_attn_metadata.seq_lens_cpu[:batch_size] = (
+                common_attn_metadata.seq_lens_cpu[:batch_size] + 1)
+            exceeds_mask = common_attn_metadata.seq_lens_cpu[:batch_size] > \
+                self.max_model_len
+            common_attn_metadata.seq_lens_cpu[:batch_size].masked_fill_(
+                exceeds_mask, 1)
             common_attn_metadata.num_computed_tokens_cpu += 1
-            common_attn_metadata.position = clamped_positions
+            common_attn_metadata.positions[:batch_size] = clamped_positions
+            common_attn_metadata.positions[batch_size:] = 0
 
             block_size = attn_metadata_builder.kv_cache_spec.block_size
 
