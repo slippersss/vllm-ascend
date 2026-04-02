@@ -32,6 +32,7 @@ class NPUCommunicator(DeviceCommunicatorBase):
         # TODO(hz): Refer to CudaCommunicator's implementation to integrate PyHcclCommunicator
         # init device according to rank
         self.device = torch.npu.current_device()
+        self.ca_comm = None
 
     def all_to_all(
         self,
