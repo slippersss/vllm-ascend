@@ -502,6 +502,57 @@ class TestAscendAttentionBackendImpl(TestBase):
         mock_npu_fused_infer_attention_score.assert_called_once()
         assert output.shape == (10, 8, 64)
 
+    @patch("torch_npu.npu_scatter_pa_kv_cache")
+    @patch("torch_npu.npu_fused_infer_attention_score")
+    @patch("vllm_ascend.ascend_forward_context.get_forward_context")
+    def test_forward_finalizes_pending_reject_once(
+        self, mock_get_forward_context, mock_npu_fused_infer_attention_score, mock_npu_scatter_pa_kv_cache
+    ):
+        """Deferred parallel-draft reject finalize at FIA forward entry.
+
+        ``seq_lens_list`` carries optimistic+query_len; the forward entry
+        synchronizes the side-stream reject D2H and subtracts the per-request
+        reject count exactly once, and the corrected list flows to FIA.
+        """
+        query = torch.randn(10, 8, 64)
+        key = torch.randn(10, 8, 64)
+        value = torch.randn(10, 8, 64)
+        kv_cache = torch.empty(2, 5, 128, 8, 64)
+        output = torch.empty_like(query)
+        metadata = self.attn_metadata
+        metadata.attn_state = AscendAttentionState.PrefillCacheHit
+        metadata.attn_mask = torch.randn(1, 1, 10, 10)
+        metadata.query_lens = torch.tensor([10])
+        metadata.seq_lens = torch.tensor([100])
+        metadata.seq_lens_list = [104]  # optimistic + query_len
+        metadata.actual_seq_lengths_q = [10]
+        metadata.block_tables = torch.zeros(1, 5, dtype=torch.long)
+        metadata.num_actual_tokens = 10
+        metadata.num_decode_tokens = 0
+        metadata.num_decodes = 0
+        metadata.num_prefills = 10
+        metadata.slot_mapping = torch.zeros(10, dtype=torch.long)
+        reject_event = MagicMock()
+        metadata.pending_reject_event = reject_event
+        metadata.pending_reject_cpu = torch.tensor([2], dtype=torch.int32)
+        metadata.pending_reject_num_reqs = 1
+        metadata.reject_finalized = False
+        layer = self.layer_no_quant
+
+        mock_get_forward_context.return_value = MagicMock(capturing=False)
+        mock_npu_fused_infer_attention_score.return_value = (torch.ones(10, 8, 64), torch.ones(10, 8, 64))
+        self.impl.forward(layer, query, key, value, kv_cache, metadata, output)
+
+        reject_event.synchronize.assert_called_once()
+        assert metadata.seq_lens_list == [102]  # 104 - 2
+        assert metadata.reject_finalized is True
+        assert mock_npu_fused_infer_attention_score.call_args.kwargs["actual_seq_lengths_kv"] == [102]
+
+        # Second layer sharing this metadata: finalize must not re-run.
+        self.impl.forward(layer, query, key, value, kv_cache, metadata, output)
+        assert reject_event.synchronize.call_count == 1
+        assert metadata.seq_lens_list == [102]
+
     @patch("vllm_ascend.attention.attention_v1.using_paged_attention")
     @patch("torch_npu._npu_paged_attention")
     @patch("torch_npu.npu_scatter_pa_kv_cache")

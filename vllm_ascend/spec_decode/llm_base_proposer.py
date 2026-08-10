@@ -912,13 +912,24 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         batch_size: int,
         num_draft_tokens_cpu: list[int] | None,
     ) -> None:
-        """Publish exact host KV lengths for Ascend parallel-draft FIA.
+        """Publish optimistic host KV lengths for Ascend parallel-draft FIA.
 
         Async scheduling intentionally leaves the normal CPU sequence-length
-        mirrors optimistic. The accepted-token counts are already copied to a
-        pinned host buffer on a side stream. Wait only for that copy, then
-        reconstruct the current draft lengths on CPU; this avoids
-        ``seq_lens.tolist()`` synchronizing the whole NPU default stream.
+        mirrors optimistic. Rather than synchronizing the reject-counts D2H
+        here (on the draft critical path), publish the optimistic lengths plus
+        the draft query block and, for the padded+async path, stash the
+        side-stream reject-counts mirror + event. The per-layer attention
+        metadata copies them and the FIA forward entry synchronizes the event
+        and subtracts the per-request reject count from ``seq_lens_list`` --
+        by then the D2H has overlapped with metadata build and the early draft
+        forward.
+
+        Three cases (preserving prior behavior except for the padded+async
+        deferral): non-padded (``num_draft_tokens_cpu is None``) publishes
+        optimistic+query with no reject; padded+async publishes optimistic+query
+        plus the deferred reject fields; padded+non-async leaves
+        ``parallel_draft_seq_lens_cpu`` unset so the builder falls back to the
+        (already-exact) device ``seq_lens``.
         """
         if not self.parallel_drafting or not hasattr(self, "num_query_per_req"):
             return
@@ -931,23 +942,20 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         if seq_lens_cpu is None:
             return
 
-        valid_counts_cpu = None
-        if num_draft_tokens_cpu is not None:
-            event = self.runner.valid_sampled_token_count_event
-            valid_counts_cpu = self.runner.valid_sampled_token_count_cpu
-            # Non-async callers do not maintain the side-stream host mirror;
-            # keep their existing device seq_lens fallback.
-            if event is None or valid_counts_cpu is None:
-                return
-            event.synchronize()
+        reject_event = getattr(self.runner, "num_rejected_tokens_event", None)
+        async_padded = num_draft_tokens_cpu is not None and reject_event is not None
 
-        common_attn_metadata.parallel_draft_seq_lens_cpu = build_parallel_draft_seq_lens_cpu(
-            seq_lens_cpu,
-            num_draft_tokens_cpu,
-            valid_counts_cpu,
-            batch_size,
-            self.num_query_per_req,
-        )
+        if num_draft_tokens_cpu is None or async_padded:
+            common_attn_metadata.parallel_draft_seq_lens_cpu = build_parallel_draft_seq_lens_cpu(
+                seq_lens_cpu,
+                batch_size,
+                self.num_query_per_req,
+            )
+            if async_padded:
+                common_attn_metadata.parallel_draft_num_reject_cpu = self.runner.num_rejected_tokens_cpu
+                common_attn_metadata.parallel_draft_num_reject_event = reject_event
+                common_attn_metadata.parallel_draft_num_reject_num_reqs = batch_size
+        # else: padded + non-async -> leave unset; builder falls back to device seq_lens.
 
     def _propose(
         self,

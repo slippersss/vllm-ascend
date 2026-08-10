@@ -200,6 +200,17 @@ class AscendMetadata:
     # prefill reshape_and_cache event
     reshape_cache_event: torch.npu.Event = None
 
+    # Deferred parallel-draft reject finalize (dspark async spec decode). The
+    # builder copies these from AscendCommonAttentionMetadata when the proposer
+    # published an optimistic parallel_draft_seq_lens_cpu; the FIA forward entry
+    # synchronizes the event and subtracts the per-request reject count from
+    # ``seq_lens_list`` exactly once (``reject_finalized`` guards re-entry across
+    # layers sharing this metadata object). None when no finalize is pending.
+    pending_reject_cpu: torch.Tensor = None
+    pending_reject_event: torch.npu.Event = None
+    pending_reject_num_reqs: int = 0
+    reject_finalized: bool = False
+
 
 class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
     """
@@ -395,6 +406,10 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             num_decodes=num_decodes,
             causal=common_attn_metadata.causal,
             model_runner_type=self.model_config.runner_type,
+            pending_reject_cpu=common_attn_metadata.parallel_draft_num_reject_cpu,
+            pending_reject_event=common_attn_metadata.parallel_draft_num_reject_event,
+            pending_reject_num_reqs=common_attn_metadata.parallel_draft_num_reject_num_reqs,
+            reject_finalized=False,
             **backend_metadata,
         )
         return attn_metadata
@@ -1293,6 +1308,25 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 output[:num_tokens] = attn_output[:num_tokens]
                 return output
         passed_value = value
+        # Deferred parallel-draft reject finalize (dspark async spec decode):
+        # synchronize the side-stream D2H of num_rejected_tokens and subtract
+        # the per-request reject count from seq_lens_list -- the host list FIA
+        # consumes as actual_seq_lengths_kv. Runs once per metadata object;
+        # layers sharing this metadata skip via reject_finalized. The D2H was
+        # launched right after prepare_inputs_padded, so by the first attention
+        # layer the copy is typically already complete (sync is a no-op).
+        if (
+            attn_metadata.pending_reject_event is not None
+            and not attn_metadata.reject_finalized
+        ):
+            attn_metadata.pending_reject_event.synchronize()
+            reject = attn_metadata.pending_reject_cpu[
+                : attn_metadata.pending_reject_num_reqs
+            ].tolist()
+            seq_lens_list = attn_metadata.seq_lens_list
+            for i in range(attn_metadata.pending_reject_num_reqs):
+                seq_lens_list[i] -= reject[i]
+            attn_metadata.reject_finalized = True
         key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(
             key, value, attn_metadata, kv_cache
         )
