@@ -303,9 +303,17 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         )
 
         block_table = common_attn_metadata.block_table_tensor
-        # Prefer _seq_lens_cpu (always available, updated during draft
-        # iterations) over seq_lens_cpu (None in async spec decode mode).
-        if common_attn_metadata._seq_lens_cpu is not None:
+        # Parallel drafting needs the exact post-rejection length. In async
+        # mode the regular CPU mirrors are optimistic; the proposer supplies
+        # an exact host copy reconstructed from accepted-token counts. Keep the
+        # device fallback for callers that do not provide that contract.
+        if common_attn_metadata.parallel_draft_seq_lens_cpu is not None:
+            seq_lens = common_attn_metadata.parallel_draft_seq_lens_cpu[:num_reqs]
+        elif self.speculative_config and self.speculative_config.parallel_drafting:
+            seq_lens = common_attn_metadata.seq_lens
+        # Prefer _seq_lens_cpu (always available, updated during non-parallel
+        # draft iterations) over seq_lens_cpu (None in async spec mode).
+        elif common_attn_metadata._seq_lens_cpu is not None:
             seq_lens = common_attn_metadata._seq_lens_cpu[:num_reqs]
         elif common_attn_metadata.seq_lens_cpu is not None:
             seq_lens = common_attn_metadata.seq_lens_cpu[:num_reqs]
@@ -318,9 +326,6 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         if isinstance(self.kv_cache_spec, CrossAttentionSpec):
             seq_lens = common_attn_metadata.seq_lens
             slot_mapping = common_attn_metadata.slot_mapping.to(torch.int32)
-        elif self.speculative_config and self.speculative_config.parallel_drafting:
-            seq_lens = common_attn_metadata.seq_lens
-
         attn_state = common_attn_metadata.attn_state
 
         # Get attn_mask from singleton AttentionMaskBuilder
