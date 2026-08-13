@@ -316,11 +316,14 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             slot_mapping = common_attn_metadata.slot_mapping.to(torch.int32)
         elif self.speculative_config and self.speculative_config.parallel_drafting:
             # Prefer the optimistic host mirror published by the proposer
-            # (target seq_lens + draft query block, no reject correction) so
-            # the tolist() below does NOT synchronize the device seq_lens.
-            # Reject is subtracted later in update_graph_params (update_stream).
+            # (draft: target seq_lens + draft query block, no reject correction)
+            # so the tolist() below does NOT synchronize the device seq_lens.
+            # For the target model (no parallel_draft_seq_lens_cpu set), fall
+            # back to _seq_lens_cpu (host optimistic) to also avoid device sync.
             if common_attn_metadata.parallel_draft_seq_lens_cpu is not None:
                 seq_lens = common_attn_metadata.parallel_draft_seq_lens_cpu[:num_reqs]
+            elif common_attn_metadata._seq_lens_cpu is not None:
+                seq_lens = common_attn_metadata._seq_lens_cpu[:num_reqs]
             else:
                 seq_lens = common_attn_metadata.seq_lens
 
