@@ -500,6 +500,12 @@ class NPUModelRunner(GPUModelRunner):
             and self.model_config.is_mm_prefix_lm,
         )
 
+        # Declared unconditionally so call sites can guard with ``is None``
+        # without AttributeError on the non-async path.
+        self.num_rejected_tokens_cpu: torch.Tensor | None = None
+        self.num_rejected_tokens_event: Any = None
+        self.num_rejected_tokens_copy_stream = None
+
         # reinit valid_sampled_token_count_cpu with torch.int64 dtype
         if self.use_async_scheduling and self.num_spec_tokens:
             self.valid_sampled_token_count_cpu = torch.empty(
@@ -508,6 +514,19 @@ class NPUModelRunner(GPUModelRunner):
                 device="cpu",
                 pin_memory=self.pin_memory,
             )
+            # Side-stream host mirror of num_rejected_tokens_gpu (int32 to match
+            # the device tensor produced by prepare_inputs_padded). The draft
+            # update_graph_params path (update_stream) waits on this event before
+            # subtracting the per-request reject count from seq_lens_list, so the
+            # D2H overlaps with main-stream graph replay instead of blocking it.
+            self.num_rejected_tokens_cpu = torch.empty(
+                self.max_num_reqs,
+                dtype=torch.int32,
+                device="cpu",
+                pin_memory=self.pin_memory,
+            )
+            self.num_rejected_tokens_event = torch.npu.Event()
+            self.num_rejected_tokens_copy_stream = torch.npu.Stream()
 
         try:
             self.dcp_size = get_dcp_group().world_size
@@ -1556,6 +1575,25 @@ class NPUModelRunner(GPUModelRunner):
             self.valid_sampled_token_count_gpu = valid_sampled_tokens_count # type: ignore[no-redef]
         self.input_batch.prev_sampled_token_ids = next_token_ids.unsqueeze(1)
 
+    def _copy_num_rejected_tokens(self, num_rejected_tokens_gpu: torch.Tensor) -> None:
+        """Async D2H the per-request reject counts onto a side stream.
+
+        The draft update_graph_params path (update_stream) waits on this event
+        before subtracting the per-request reject count from seq_lens_list,
+        overlapping the D2H with main-stream graph replay.
+        """
+        if self.num_rejected_tokens_event is None:
+            return
+        default_stream = torch.npu.current_stream()
+        with torch.npu.stream(self.num_rejected_tokens_copy_stream):
+            self.num_rejected_tokens_copy_stream.wait_stream(default_stream)
+            n = num_rejected_tokens_gpu.shape[0]
+            assert self.num_rejected_tokens_cpu is not None
+            self.num_rejected_tokens_cpu[:n].copy_(
+                num_rejected_tokens_gpu[:n], non_blocking=True
+            )
+            self.num_rejected_tokens_event.record()
+
     def propose_draft_token_ids(
         self,
         valid_sampled_token_ids: torch.Tensor | list[list[int]],
@@ -1739,6 +1777,8 @@ class NPUModelRunner(GPUModelRunner):
                             common_attn_metadata, spec_decode_metadata, valid_sampled_tokens_count
                         )
                     )
+                    if num_rejected_tokens_gpu is not None and self.num_rejected_tokens_event is not None:
+                        self._copy_num_rejected_tokens(num_rejected_tokens_gpu)
                 target_token_ids = self.input_ids.gpu[token_indices]
                 target_positions = self._get_positions(token_indices)
                 if self.use_aux_hidden_state_outputs:

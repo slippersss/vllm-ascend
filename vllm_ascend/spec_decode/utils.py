@@ -81,6 +81,25 @@ def correct_optimistic_seq_lens_cpu(
     optimistic_seq_lens_cpu_np[:num_reqs] -= correction.astype(optimistic_seq_lens_cpu_np.dtype, copy=False)
 
 
+def build_parallel_draft_seq_lens_cpu(
+    seq_lens_cpu: torch.Tensor,
+    num_reqs: int,
+    query_len: int,
+) -> torch.Tensor:
+    """Build optimistic FIA KV lengths for one parallel-draft pass on the CPU.
+
+    ``seq_lens_cpu`` contains the target pass's optimistic lengths (async mode
+    assumes all prior drafts accepted). Add the parallel draft query block that
+    will be written to cache. The post-rejection correction is deferred to
+    update_graph_params (on update_stream), where the asynchronously-copied
+    reject counts are synchronized and subtracted from ``seq_lens_list``.
+    The source tensor is never modified.
+    """
+    out = seq_lens_cpu.clone()
+    out[:num_reqs].add_(query_len)
+    return out
+
+
 class SlidingWindowAdapter:
     """
     Sliding-window draft attention for the draft model (EAGLE3 and DFlash).

@@ -315,7 +315,14 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             seq_lens = common_attn_metadata.seq_lens
             slot_mapping = common_attn_metadata.slot_mapping.to(torch.int32)
         elif self.speculative_config and self.speculative_config.parallel_drafting:
-            seq_lens = common_attn_metadata.seq_lens
+            # Prefer the optimistic host mirror published by the proposer
+            # (target seq_lens + draft query block, no reject correction) so
+            # the tolist() below does NOT synchronize the device seq_lens.
+            # Reject is subtracted later in update_graph_params (update_stream).
+            if common_attn_metadata.parallel_draft_seq_lens_cpu is not None:
+                seq_lens = common_attn_metadata.parallel_draft_seq_lens_cpu[:num_reqs]
+            else:
+                seq_lens = common_attn_metadata.seq_lens
 
         attn_state = common_attn_metadata.attn_state
 
@@ -727,6 +734,19 @@ class AscendAttentionBackendImpl(AttentionImpl):
             attn_count = 0
             layer_count = 0
             with torch.npu.stream(update_stream):
+                # For DSpark FULL graph: wait for the async num_rejected_tokens
+                # D2H (launched in propose_draft_token_ids) before correcting
+                # seq_lens_list. This runs on update_stream, so main-stream graph
+                # replay is not blocked. num_rejected_tokens_cpu is a pinned host
+                # tensor; the .tolist() below reads it after the event fires.
+                reject_cpu = getattr(forward_context, "pending_reject_cpu", None)
+                reject_event = getattr(forward_context, "pending_reject_event", None)
+                reject_num_reqs = getattr(forward_context, "pending_reject_num_reqs", 0)
+                if reject_event is not None:
+                    reject_event.wait(update_stream)
+                    reject = reject_cpu[:reject_num_reqs].tolist()
+                else:
+                    reject = None
                 for key, param, handle, event in zip(
                     attn_keys,
                     captured_attn_params,
@@ -781,6 +801,11 @@ class AscendAttentionBackendImpl(AttentionImpl):
                         draft_step, key = draft_attn_key_steps[attn_count]
                         metadata = attn_metadata[draft_step][key]
                         seq_lens = metadata.seq_lens_list
+                        # DSpark FULL: subtract async-copied reject counts from
+                        # the optimistic seq_lens_list so FIA gets exact KV lengths.
+                        if reject is not None:
+                            n = min(len(reject), len(seq_lens))
+                            seq_lens = [seq_lens[i] - reject[i] for i in range(n)] + seq_lens[n:]
                         actual_seq_lengths_q = metadata.actual_seq_lengths_q
                         block_tables = metadata.block_tables
                         attn_count = attn_count + 1

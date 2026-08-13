@@ -263,6 +263,13 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     req_ids_tensor: torch.Tensor | None = None
     token_to_req: torch.Tensor | None = None
 
+    # Optimistic host-side KV lengths for the current parallel-draft pass:
+    # target optimistic seq_lens + the draft query block. When set, the builder
+    # uses this instead of device seq_lens.tolist() to avoid a D2H sync on the
+    # draft critical path. The post-rejection correction is done later in
+    # update_graph_params (on update_stream, not blocking main stream).
+    parallel_draft_seq_lens_cpu: torch.Tensor = None
+
     # TODO: Remove it when vLLM no longer uses this function.
     def unpadded(self, num_actual_tokens: int, num_actual_reqs: int) -> "AscendCommonAttentionMetadata":
         # This only use to eagle now. It will be use to enforce_eager in future.

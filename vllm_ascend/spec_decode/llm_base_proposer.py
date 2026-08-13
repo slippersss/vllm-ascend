@@ -959,6 +959,28 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         common_attn_metadata.num_input_tokens = num_input_tokens
 
         self._pad_draft_buffers(num_tokens, num_input_tokens)
+
+        # Publish optimistic parallel-draft KV lengths (target optimistic
+        # seq_lens + draft query block, NOT reject-corrected) so the builder
+        # uses this host tensor instead of device seq_lens.tolist() (avoids
+        # D2H sync on the draft critical path). The reject correction is done
+        # later in update_graph_params (on update_stream, not blocking main).
+        if (
+            self.parallel_drafting
+            and num_rejected_tokens_gpu is not None
+            and getattr(self.runner, "num_rejected_tokens_event", None) is not None
+        ):
+            optimistic = self.runner.optimistic_seq_lens_cpu
+            if optimistic is not None:
+                from vllm_ascend.spec_decode.utils import (
+                    build_parallel_draft_seq_lens_cpu,
+                )
+                common_attn_metadata.parallel_draft_seq_lens_cpu = (
+                    build_parallel_draft_seq_lens_cpu(
+                        optimistic, num_reqs_padded, self.num_query_per_req
+                    )
+                )
+
         multi_steps_attn_metadata, attn_metadata_i = self.build_draft_attn_metadata(
             common_attn_metadata, num_input_tokens, num_tokens
         )
@@ -1051,6 +1073,15 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             forward_context = get_forward_context()
             if forward_context is not None:
                 forward_context.moe_layer_index = 0
+                # Stash the async reject D2H mirror + event onto forward_context
+                # so update_graph_params (running on update_stream) can wait on
+                # the event and subtract per-request reject from seq_lens_list
+                # without blocking main stream.
+                reject_event = getattr(self.runner, "num_rejected_tokens_event", None)
+                if reject_event is not None:
+                    forward_context.pending_reject_cpu = self.runner.num_rejected_tokens_cpu
+                    forward_context.pending_reject_event = reject_event
+                    forward_context.pending_reject_num_reqs = num_reqs_padded
 
             model_inputs: dict[str, Any] = {
                 "num_input_tokens": num_input_tokens,
