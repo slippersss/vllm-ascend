@@ -536,6 +536,9 @@ class AscendDSparkProposer(AscendDflashProposer):
                 )
 
             else:
+                self._context_slot_mapping_buffers = [
+                    self._per_group_context_slot_mapping_buffers[gidx] for gidx in self._layer_group_idx
+                ]
                 self._runnable(
                     num_input_tokens=num_input_tokens,
                     batch_size=num_reqs,
