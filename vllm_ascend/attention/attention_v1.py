@@ -196,6 +196,16 @@ class AscendMetadata:
     # prefill reshape_and_cache event
     reshape_cache_event: torch.npu.Event = None
 
+    # Deferred parallel-draft reject finalize. When set, the FIA forward entry
+    # (forward_fused_infer_attention, after the capturing branch) synchronizes
+    # the event and subtracts per-request reject from seq_lens_list. Used by
+    # the eager path (mixed batch); the FULL graph path uses update_graph_params
+    # on update_stream instead. None when no finalize is pending.
+    pending_reject_cpu: torch.Tensor = None
+    pending_reject_event: Any = None
+    pending_reject_num_reqs: int = 0
+    reject_finalized: bool = False
+
 
 class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
     """
@@ -396,6 +406,14 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             num_decodes=num_decodes,
             causal=common_attn_metadata.causal,
             model_runner_type=self.model_config.runner_type,
+            # Deferred reject finalize: copy transient attributes stashed by
+            # the proposer onto common_attn_metadata. The FIA forward entry
+            # (eager path only) synchronizes and subtracts. None/False when
+            # no parallel-draft reject is pending.
+            pending_reject_cpu=getattr(common_attn_metadata, "pending_reject_cpu", None),
+            pending_reject_event=getattr(common_attn_metadata, "pending_reject_event", None),
+            pending_reject_num_reqs=getattr(common_attn_metadata, "pending_reject_num_reqs", 0),
+            reject_finalized=False,
             **backend_metadata,
         )
         return attn_metadata
@@ -1314,6 +1332,31 @@ class AscendAttentionBackendImpl(AttentionImpl):
                 attn_output, num_tokens = self.full_graph_fia(query, key, value, attn_metadata, output)
                 output[:num_tokens] = attn_output[:num_tokens]
                 return output
+        # Deferred parallel-draft reject finalize (eager path only).
+        # Capturing branch above returns early, so this runs only when NOT
+        # capturing — i.e. eager mode (mixed batch). FULL graph replay
+        # never calls forward_fused_infer_attention (it replays the captured
+        # NPU graph directly), so this is skipped there too; FULL uses
+        # update_graph_params on update_stream instead.
+        # Synchronize the async reject D2H and subtract per-request reject
+        # from seq_lens_list so _get_fia_params gets exact KV lengths.
+        # Runs once per metadata object; layers sharing it skip via
+        # reject_finalized. The D2H was launched in propose_draft_token_ids,
+        # so by the first attention layer the copy is typically already
+        # complete (sync is effectively a no-op in steady state).
+        if (
+            attn_metadata.pending_reject_event is not None
+            and not attn_metadata.reject_finalized
+        ):
+            attn_metadata.pending_reject_event.synchronize()
+            reject = attn_metadata.pending_reject_cpu[
+                : attn_metadata.pending_reject_num_reqs
+            ].tolist()
+            seq_lens_list = attn_metadata.seq_lens_list
+            for i in range(attn_metadata.pending_reject_num_reqs):
+                if i < len(seq_lens_list):
+                    seq_lens_list[i] -= reject[i]
+            attn_metadata.reject_finalized = True
         passed_value = value
         key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(
             key, value, attn_metadata, kv_cache

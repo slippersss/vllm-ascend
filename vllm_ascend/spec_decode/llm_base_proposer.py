@@ -980,6 +980,16 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                         optimistic, num_reqs_padded, self.num_query_per_req
                     )
                 )
+                # Stash reject cpu/event onto common_attn_metadata for the
+                # eager path (build's seq_lens_list correction). The FULL
+                # graph path reads these from forward_context (set at :1076).
+                common_attn_metadata.pending_reject_cpu = (
+                    self.runner.num_rejected_tokens_cpu
+                )
+                common_attn_metadata.pending_reject_event = (
+                    self.runner.num_rejected_tokens_event
+                )
+                common_attn_metadata.pending_reject_num_reqs = num_reqs_padded
 
         multi_steps_attn_metadata, attn_metadata_i = self.build_draft_attn_metadata(
             common_attn_metadata, num_input_tokens, num_tokens
