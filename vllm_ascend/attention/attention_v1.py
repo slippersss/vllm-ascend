@@ -158,6 +158,10 @@ class AscendMetadata:
 
     # **************************** Basic Properties ************************** #
     attn_mask: torch.Tensor | None = None
+    # DSpark lossy optimistic-length fallback. These fixed-width device tensors
+    # describe the logical KV-cache tail to preserve/zero before FIA.
+    dspark_kv_zero_positions: torch.Tensor | None = None
+    dspark_kv_zero_keep_mask: torch.Tensor | None = None
     # Current state of this attention run.
     attn_state: AscendAttentionState = AscendAttentionState.ChunkedPrefill
 
@@ -330,7 +334,13 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         query_start_loc = query_start_loc_cpu.pin_memory().to(self.device, non_blocking=True)
 
         actual_seq_lengths_q = query_start_loc_cpu[1:].tolist()
-        seq_lens_list = seq_lens.tolist()
+        dspark_optimistic_seq_lens_cpu = getattr(
+            common_attn_metadata, "dspark_optimistic_seq_lens_cpu", None
+        )
+        if dspark_optimistic_seq_lens_cpu is not None:
+            seq_lens_list = dspark_optimistic_seq_lens_cpu[:num_reqs].tolist()
+        else:
+            seq_lens_list = seq_lens.tolist()
         # flashcomm1/SP (or cudagraph) padding makes the model runner insert a
         # dummy padding request into query_start_loc to satisfy the FIA TND-layout
         # constraint (sum of q lengths == hidden_states.shape[0]), bumping the
@@ -385,6 +395,8 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             actual_seq_lengths_q=actual_seq_lengths_q,
             slot_mapping=slot_mapping,
             attn_mask=attn_mask,
+            dspark_kv_zero_positions=getattr(common_attn_metadata, "dspark_kv_zero_positions", None),
+            dspark_kv_zero_keep_mask=getattr(common_attn_metadata, "dspark_kv_zero_keep_mask", None),
             attn_state=attn_state,
             num_prefills=num_prefills,
             num_decodes=num_decodes,
@@ -1269,6 +1281,42 @@ class AscendAttentionBackendImpl(AttentionImpl):
             actual_seq_lengths_kv = attn_metadata.seq_lens_list
         return key, value, block_size, block_table, actual_seq_lengths_kv
 
+    def _zero_dspark_optimistic_kv_suffix(
+        self,
+        attn_metadata: AscendMetadata,
+        block_size: int,
+        block_table: torch.Tensor | None,
+    ) -> None:
+        """Zero rejected DSpark KV slots without reading reject counts on host.
+
+        The metadata carries a fixed-width logical tail window and a device
+        keep mask. Valid positions are read and written back unchanged, while
+        the optimistic suffix is replaced with zero K/V. This is deliberately
+        lossy: zero-key slots remain in FIA's softmax denominator.
+        """
+        positions = attn_metadata.dspark_kv_zero_positions
+        keep_mask = attn_metadata.dspark_kv_zero_keep_mask
+        if positions is None or keep_mask is None:
+            return
+        if block_table is None or self.key_cache is None or self.value_cache is None:
+            raise RuntimeError("DSpark optimistic KV zeroing requires page-attention caches")
+
+        safe_positions = positions.clamp_min(0)
+        logical_blocks = torch.div(safe_positions, block_size, rounding_mode="floor").to(torch.long)
+        block_ids = torch.gather(block_table[: positions.shape[0]], 1, logical_blocks)
+        physical_slots = block_ids.to(torch.long) * block_size + torch.remainder(safe_positions, block_size).to(
+            torch.long
+        )
+        flat_slots = physical_slots.reshape(-1)
+
+        key_cache = self.key_cache.view(-1, *self.key_cache.shape[2:])
+        value_cache = self.value_cache.view(-1, *self.value_cache.shape[2:])
+        keep = keep_mask.reshape(-1, *([1] * (key_cache.dim() - 1)))
+        key_values = torch.where(keep, key_cache.index_select(0, flat_slots), 0)
+        value_values = torch.where(keep, value_cache.index_select(0, flat_slots), 0)
+        key_cache.index_copy_(0, flat_slots, key_values)
+        value_cache.index_copy_(0, flat_slots, value_values)
+
     def forward_fused_infer_attention(
         self,
         query: torch.Tensor,
@@ -1294,6 +1342,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
         key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(
             key, value, attn_metadata, kv_cache
         )
+        self._zero_dspark_optimistic_kv_suffix(attn_metadata, block_size, block_table)
         num_tokens = attn_metadata.actual_seq_lengths_q[-1]
         query = query[:num_tokens]
         if (
