@@ -283,8 +283,8 @@ class AscendDSparkProposer(AscendDflashProposer):
             effective_seq_lens = effective_seq_lens - num_rejected_tokens_gpu
 
         # FIA still consumes host-side KV lengths. Keep them optimistic to
-        # avoid synchronizing the device-produced rejected-token count. The
-        # stale suffix is neutralized in attention_v1 by zeroing its cached K/V.
+        # avoid synchronizing the device-produced rejected-token count. A
+        # device-built PSE bias excludes the stale suffix before softmax.
         seq_lens_cpu = getattr(cad, "_seq_lens_cpu", None)
         if seq_lens_cpu is None:
             seq_lens_cpu = getattr(cad, "seq_lens_cpu", None)
@@ -299,26 +299,21 @@ class AscendDSparkProposer(AscendDflashProposer):
         cad.seq_lens = effective_seq_lens + self.num_query_per_req
         cad.dspark_optimistic_seq_lens_cpu = optimistic_seq_lens_cpu
 
-        # Use a fixed-width device window ending at the optimistic length. The
-        # attention backend rewrites positions in [true_len, optimistic_len)
-        # with zero K/V and preserves the preceding positions. No reject value
-        # is materialized on host and the tensor shapes are step-invariant.
+        # The width depends only on already-host-resident optimistic lengths;
+        # reject-dependent comparisons stay on device and cannot synchronize.
         if has_num_rejected:
-            zero_window = self.num_speculative_tokens
-            zero_offsets = torch.arange(
-                zero_window,
+            kv_width = (int(optimistic_seq_lens_cpu.max().item()) + 15) // 16 * 16
+            kv_positions = torch.arange(
+                kv_width,
                 dtype=cad.seq_lens.dtype,
                 device=cad.seq_lens.device,
-            )
-            optimistic_seq_lens = cad.seq_lens[:batch_size] + num_rejected_tokens_gpu
-            zero_positions = optimistic_seq_lens.view(-1, 1) - zero_window + zero_offsets.view(1, -1)
-            cad.dspark_kv_zero_positions = zero_positions
-            cad.dspark_kv_zero_keep_mask = (zero_positions < cad.seq_lens[:batch_size].view(-1, 1)) | (
-                zero_positions < 0
-            )
+            ).view(1, -1)
+            true_seq_lens = cad.seq_lens[:batch_size].view(-1, 1)
+            optimistic_seq_lens = true_seq_lens + num_rejected_tokens_gpu.view(-1, 1)
+            invalid_suffix = (kv_positions >= true_seq_lens) & (kv_positions < optimistic_seq_lens)
+            cad.dspark_optimistic_invalid_kv_mask = invalid_suffix.view(batch_size, 1, 1, kv_width)
         else:
-            cad.dspark_kv_zero_positions = None
-            cad.dspark_kv_zero_keep_mask = None
+            cad.dspark_optimistic_invalid_kv_mask = None
         cad.query_start_loc_cpu = (
             torch.from_numpy(self.token_arange_np[: batch_size + 1]).clone() * self.num_query_per_req
         ).to(torch.int32)

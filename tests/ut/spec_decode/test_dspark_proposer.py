@@ -667,14 +667,12 @@ class TestSetInputsFirstPassRejectedTokens(_DSparkProposerTestBase):
             cad.dspark_optimistic_seq_lens_cpu,
             torch.full((num_reqs,), 128 + block_size, dtype=torch.int32),
         )
-        expected_positions = torch.arange(
-            128 + block_size - proposer.num_speculative_tokens,
-            128 + block_size,
-            dtype=torch.int32,
-        ).expand(num_reqs, -1)
-        assert torch.equal(cad.dspark_kv_zero_positions, expected_positions)
-        expected_keep = expected_positions < (128 - 2 + block_size)
-        assert torch.equal(cad.dspark_kv_zero_keep_mask, expected_keep)
+        kv_width = (128 + block_size + 15) // 16 * 16
+        positions = torch.arange(kv_width, dtype=torch.int32)
+        expected_invalid = (
+            (positions >= 128 - 2 + block_size) & (positions < 128 + block_size)
+        ).view(1, 1, 1, kv_width).expand(num_reqs, -1, -1, -1)
+        assert torch.equal(cad.dspark_optimistic_invalid_kv_mask, expected_invalid)
 
     def test_kernel_called_with_has_num_rejected(self, monkeypatch):
         kernel = MagicMock()

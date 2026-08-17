@@ -158,10 +158,9 @@ class AscendMetadata:
 
     # **************************** Basic Properties ************************** #
     attn_mask: torch.Tensor | None = None
-    # DSpark lossy optimistic-length fallback. These fixed-width device tensors
-    # describe the logical KV-cache tail to preserve/zero before FIA.
-    dspark_kv_zero_positions: torch.Tensor | None = None
-    dspark_kv_zero_keep_mask: torch.Tensor | None = None
+    # Device-side mask for the rejected KV suffix while FIA consumes host-side
+    # optimistic lengths. True entries receive a -inf PSE bias before softmax.
+    dspark_optimistic_invalid_kv_mask: torch.Tensor | None = None
     # Current state of this attention run.
     attn_state: AscendAttentionState = AscendAttentionState.ChunkedPrefill
 
@@ -395,8 +394,9 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             actual_seq_lengths_q=actual_seq_lengths_q,
             slot_mapping=slot_mapping,
             attn_mask=attn_mask,
-            dspark_kv_zero_positions=getattr(common_attn_metadata, "dspark_kv_zero_positions", None),
-            dspark_kv_zero_keep_mask=getattr(common_attn_metadata, "dspark_kv_zero_keep_mask", None),
+            dspark_optimistic_invalid_kv_mask=getattr(
+                common_attn_metadata, "dspark_optimistic_invalid_kv_mask", None
+            ),
             attn_state=attn_state,
             num_prefills=num_prefills,
             num_decodes=num_decodes,
@@ -1281,41 +1281,24 @@ class AscendAttentionBackendImpl(AttentionImpl):
             actual_seq_lengths_kv = attn_metadata.seq_lens_list
         return key, value, block_size, block_table, actual_seq_lengths_kv
 
-    def _zero_dspark_optimistic_kv_suffix(
+    def _build_dspark_optimistic_pse_shift(
         self,
+        query: torch.Tensor,
         attn_metadata: AscendMetadata,
-        block_size: int,
-        block_table: torch.Tensor | None,
-    ) -> None:
-        """Zero rejected DSpark KV slots without reading reject counts on host.
+    ) -> torch.Tensor | None:
+        """Convert the device reject-suffix mask to an exact pre-softmax bias."""
+        invalid_kv = attn_metadata.dspark_optimistic_invalid_kv_mask
+        if invalid_kv is None:
+            return None
 
-        The metadata carries a fixed-width logical tail window and a device
-        keep mask. Valid positions are read and written back unchanged, while
-        the optimistic suffix is replaced with zero K/V. This is deliberately
-        lossy: zero-key slots remain in FIA's softmax denominator.
-        """
-        positions = attn_metadata.dspark_kv_zero_positions
-        keep_mask = attn_metadata.dspark_kv_zero_keep_mask
-        if positions is None or keep_mask is None:
-            return
-        if block_table is None or self.key_cache is None or self.value_cache is None:
-            raise RuntimeError("DSpark optimistic KV zeroing requires page-attention caches")
-
-        safe_positions = positions.clamp_min(0)
-        logical_blocks = torch.div(safe_positions, block_size, rounding_mode="floor").to(torch.long)
-        block_ids = torch.gather(block_table[: positions.shape[0]], 1, logical_blocks)
-        physical_slots = block_ids.to(torch.long) * block_size + torch.remainder(safe_positions, block_size).to(
-            torch.long
-        )
-        flat_slots = physical_slots.reshape(-1)
-
-        key_cache = self.key_cache.view(-1, *self.key_cache.shape[2:])
-        value_cache = self.value_cache.view(-1, *self.value_cache.shape[2:])
-        keep = keep_mask.reshape(-1, *([1] * (key_cache.dim() - 1)))
-        key_values = torch.where(keep, key_cache.index_select(0, flat_slots), 0)
-        value_values = torch.where(keep, value_cache.index_select(0, flat_slots), 0)
-        key_cache.index_copy_(0, flat_slots, key_values)
-        value_cache.index_copy_(0, flat_slots, value_values)
+        batch_size, _, _, kv_width = invalid_kv.shape
+        query_len = attn_metadata.max_query_len
+        expanded_mask = invalid_kv.expand(batch_size, self.num_heads, query_len, kv_width)
+        return torch.zeros(
+            expanded_mask.shape,
+            dtype=query.dtype,
+            device=query.device,
+        ).masked_fill_(expanded_mask, float("-inf"))
 
     def forward_fused_infer_attention(
         self,
@@ -1342,7 +1325,6 @@ class AscendAttentionBackendImpl(AttentionImpl):
         key, value, block_size, block_table, actual_seq_lengths_kv = self._get_fia_params(
             key, value, attn_metadata, kv_cache
         )
-        self._zero_dspark_optimistic_kv_suffix(attn_metadata, block_size, block_table)
         num_tokens = attn_metadata.actual_seq_lengths_q[-1]
         query = query[:num_tokens]
         if (
@@ -1384,6 +1366,7 @@ class AscendAttentionBackendImpl(AttentionImpl):
                     query=query,
                     key=key,
                     value=value,
+                    pse_shift=self._build_dspark_optimistic_pse_shift(query, attn_metadata),
                     block_table=block_table,
                     input_layout="TND",
                     block_size=block_size,
