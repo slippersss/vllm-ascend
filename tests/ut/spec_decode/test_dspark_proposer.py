@@ -158,6 +158,7 @@ class _DSparkProposerTestBase:
             query_start_loc=torch.arange(num_reqs + 1, dtype=torch.int32) * block_size,
             query_start_loc_cpu=query_start_loc_cpu,
             seq_lens=torch.full((num_reqs,), seq_len, dtype=torch.int32),
+            _seq_lens_cpu=torch.full((num_reqs,), seq_len, dtype=torch.int32),
             max_seq_len=seq_len,
         )
         if with_optional_attrs:
@@ -191,6 +192,7 @@ class TestDSparkPositionsFullUnderMultiDp(_DSparkProposerTestBase):
             query_start_loc=torch.arange(num_reqs + 1, dtype=torch.int32) * block_size,
             query_start_loc_cpu=torch.zeros(num_reqs + 1, dtype=torch.int32),
             seq_lens=torch.full((num_reqs,), 128, dtype=torch.int32),
+            _seq_lens_cpu=torch.full((num_reqs,), 128, dtype=torch.int32),
             max_seq_len=128,
         )
         proposer.set_inputs_first_pass(
@@ -661,6 +663,18 @@ class TestSetInputsFirstPassRejectedTokens(_DSparkProposerTestBase):
         assert torch.equal(
             cad.seq_lens, torch.full((num_reqs,), 128 - 2 + block_size, dtype=torch.int32)
         )
+        assert torch.equal(
+            cad.dspark_optimistic_seq_lens_cpu,
+            torch.full((num_reqs,), 128 + block_size, dtype=torch.int32),
+        )
+        expected_positions = torch.arange(
+            128 + block_size - proposer.num_speculative_tokens,
+            128 + block_size,
+            dtype=torch.int32,
+        ).expand(num_reqs, -1)
+        assert torch.equal(cad.dspark_kv_zero_positions, expected_positions)
+        expected_keep = expected_positions < (128 - 2 + block_size)
+        assert torch.equal(cad.dspark_kv_zero_keep_mask, expected_keep)
 
     def test_kernel_called_with_has_num_rejected(self, monkeypatch):
         kernel = MagicMock()
