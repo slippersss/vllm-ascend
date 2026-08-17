@@ -282,8 +282,23 @@ class AscendDSparkProposer(AscendDflashProposer):
         if has_num_rejected:
             effective_seq_lens = effective_seq_lens - num_rejected_tokens_gpu
 
+        # FIA consumes host-side KV lengths. Keep the pre-verify length
+        # optimistic to avoid synchronizing device-produced reject counts.
+        # This baseline intentionally does not mask, clear, or otherwise
+        # modify the stale KV suffix.
+        seq_lens_cpu = getattr(cad, "_seq_lens_cpu", None)
+        if seq_lens_cpu is None:
+            seq_lens_cpu = getattr(cad, "seq_lens_cpu", None)
+        if seq_lens_cpu is None:
+            raise RuntimeError(
+                "DSpark requires host-resident pre-verify sequence lengths to "
+                "avoid synchronizing rejected-token counts from the device"
+            )
+        optimistic_seq_lens_cpu = seq_lens_cpu[:batch_size] + self.num_query_per_req
+
         cad.query_start_loc = self.arange_dflash[: batch_size + 1] * self.num_query_per_req
         cad.seq_lens = effective_seq_lens + self.num_query_per_req
+        cad.dspark_optimistic_seq_lens_cpu = optimistic_seq_lens_cpu
         cad.query_start_loc_cpu = (
             torch.from_numpy(self.token_arange_np[: batch_size + 1]).clone() * self.num_query_per_req
         ).to(torch.int32)

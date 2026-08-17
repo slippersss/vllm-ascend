@@ -330,7 +330,13 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         query_start_loc = query_start_loc_cpu.pin_memory().to(self.device, non_blocking=True)
 
         actual_seq_lengths_q = query_start_loc_cpu[1:].tolist()
-        seq_lens_list = seq_lens.tolist()
+        dspark_optimistic_seq_lens_cpu = getattr(
+            common_attn_metadata, "dspark_optimistic_seq_lens_cpu", None
+        )
+        if dspark_optimistic_seq_lens_cpu is not None:
+            seq_lens_list = dspark_optimistic_seq_lens_cpu[:num_reqs].tolist()
+        else:
+            seq_lens_list = seq_lens.tolist()
         # flashcomm1/SP (or cudagraph) padding makes the model runner insert a
         # dummy padding request into query_start_loc to satisfy the FIA TND-layout
         # constraint (sum of q lengths == hidden_states.shape[0]), bumping the
