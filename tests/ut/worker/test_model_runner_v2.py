@@ -7,7 +7,11 @@ import torch
 from vllm.config import CUDAGraphMode
 from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
-from vllm_ascend.worker.v2.model_runner import NPUModelRunner
+from vllm_ascend.worker.v2.aclgraph_utils import ModelWithContext
+from vllm_ascend.worker.v2.model_runner import (
+    AscendAdaptiveVerificationManager,
+    NPUModelRunner,
+)
 
 
 def _make_runner(need_timing: bool = True):
@@ -98,6 +102,125 @@ def test_full_decode_only_keeps_graph_descriptor_request_count():
 
     assert num_reqs_padded == 4
     np.testing.assert_array_equal(actual[:5], np.array([0, 1, 2, 3, 4], dtype=np.int32))
+
+
+@pytest.mark.parametrize(
+    ("num_reqs", "num_reqs_padded", "expected"),
+    [
+        (2, 4, [0, 2, 5, 6, 8]),
+        (4, 4, [0, 1, 3, 5, 8]),
+    ],
+)
+def test_adaptive_verification_padding_ends_at_graph_token_count(
+    num_reqs,
+    num_reqs_padded,
+    expected,
+):
+    runner = _make_runner()
+    runner.max_num_reqs = 4
+    query_start_loc_np = np.full(runner.max_num_reqs + 2, 5, dtype=np.int32)
+    query_start_loc_np[:3] = [0, 2, 5]
+    if num_reqs == 4:
+        query_start_loc_np[:5] = [0, 1, 3, 5, 6]
+
+    actual, num_reqs_padded = runner._pad_adaptive_query_start_loc_for_fia(
+        num_tokens_padded=8,
+        num_reqs_padded=num_reqs_padded,
+        num_reqs=num_reqs,
+        query_start_loc_np=query_start_loc_np,
+    )
+
+    assert num_reqs_padded == len(expected) - 1
+    np.testing.assert_array_equal(actual[: num_reqs_padded + 1], expected)
+
+
+def test_adaptive_verification_padding_does_not_add_empty_request():
+    runner = _make_runner()
+    runner.max_num_reqs = 4
+    query_start_loc_np = np.array([0, 1, 3, 5, 8, 8], dtype=np.int32)
+
+    actual, num_reqs_padded = runner._pad_adaptive_query_start_loc_for_fia(
+        num_tokens_padded=8,
+        num_reqs_padded=4,
+        num_reqs=4,
+        query_start_loc_np=query_start_loc_np,
+    )
+
+    assert num_reqs_padded == 4
+    np.testing.assert_array_equal(actual[:5], [0, 1, 3, 5, 8])
+
+
+def test_ascend_adaptive_reallocation_builds_monotonic_offsets():
+    manager = AscendAdaptiveVerificationManager.__new__(AscendAdaptiveVerificationManager)
+    manager._batch_budget = (
+        {"a": 1, "b": 2},
+        {"a": 3, "b": 4},
+        3,
+    )
+    manager._batch_draft_capacity = torch.empty(2, dtype=torch.int32)
+    manager._num_non_draft_tokens = torch.empty(2, dtype=torch.int32)
+    manager._cu_num_logits = torch.empty(3, dtype=torch.int32)
+    manager.query_start_loc = torch.empty(3, dtype=torch.int32)
+    manager.num_bonus_tokens = 1
+    manager.num_speculative_steps = 2
+
+    cu_num_logits, query_start_loc, draft_budget = manager.reallocate_drafts(
+        ["a", "b"],
+        torch.tensor([0, 1], dtype=torch.int32),
+    )
+
+    assert draft_budget == 3
+    torch.testing.assert_close(
+        cu_num_logits,
+        torch.tensor([0, 2, 5], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        query_start_loc,
+        torch.tensor([0, 4, 10], dtype=torch.int32),
+    )
+
+
+def test_ascend_adaptive_reallocation_eagerly_trims_draft_budget():
+    manager = AscendAdaptiveVerificationManager.__new__(AscendAdaptiveVerificationManager)
+    manager._batch_budget = (
+        {"a": 2, "b": 2},
+        {"a": 3, "b": 4},
+        2,
+    )
+    manager._batch_draft_capacity = torch.empty(2, dtype=torch.int32)
+    manager._num_non_draft_tokens = torch.empty(2, dtype=torch.int32)
+    manager._cu_num_logits = torch.empty(3, dtype=torch.int32)
+    manager.query_start_loc = torch.empty(3, dtype=torch.int32)
+    manager._confidence_probs = torch.tensor([[0.9, 0.9], [0.8, 0.1]])
+    manager.num_bonus_tokens = 1
+    manager.num_speculative_steps = 2
+
+    cu_num_logits, query_start_loc, draft_budget = manager.reallocate_drafts(
+        ["a", "b"],
+        torch.tensor([0, 1], dtype=torch.int32),
+    )
+
+    assert draft_budget == 2
+    torch.testing.assert_close(
+        cu_num_logits,
+        torch.tensor([0, 3, 4], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        query_start_loc,
+        torch.tensor([0, 5, 9], dtype=torch.int32),
+    )
+
+
+def test_model_with_context_forwards_adaptive_dspark_methods():
+    original = Mock()
+    wrapper = ModelWithContext(original)
+    tensors = [torch.tensor([i]) for i in range(4)]
+
+    wrapper.compute_confidence(tensors[0], tensors[1])
+    wrapper.apply_markov_bias_gathered(*tensors)
+
+    original.compute_confidence.assert_called_once_with(tensors[0], tensors[1])
+    original.apply_markov_bias_gathered.assert_called_once_with(*tensors)
 
 
 def test_sample_tokens_restores_replicated_draft_hidden_states():

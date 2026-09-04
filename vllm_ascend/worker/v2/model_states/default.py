@@ -67,7 +67,9 @@ class AscendModelState(DefaultModelState):
         num_actual_tokens = input_batch.num_tokens
         query_start_loc_cpu = torch.from_numpy(input_batch.query_start_loc_np)
         is_prefilling = torch.from_numpy(input_batch.is_prefilling_np)
-        max_query_len = input_batch.num_scheduled_tokens.max().item()
+        max_query_len = getattr(input_batch, "max_query_len", None)
+        if max_query_len is None:
+            max_query_len = input_batch.num_scheduled_tokens.max().item()
         pcp_context = self.pcp_manager.build_attention_context() if self.pcp_manager is not None else None
         # attn_metadata is needed when update_full_graph_params, but no way can get it now.
         # Temporarily store it in model_state.

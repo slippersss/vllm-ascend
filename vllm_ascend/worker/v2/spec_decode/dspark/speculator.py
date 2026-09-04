@@ -117,6 +117,8 @@ class AscendDSparkSpeculator(DSparkSpeculator):
                 self.input_buffers.positions,
                 num_tokens_padded,
                 torch.from_numpy(self.input_batch.is_prefilling_np),
+                num_query_per_req=self.num_query_per_req,
+                num_actual_reqs=self.input_batch.num_reqs,
             ),
         ):
             attn_metadata = self._build_draft_attn_metadata(
@@ -173,7 +175,11 @@ class AscendDSparkSpeculator(DSparkSpeculator):
         with (
             build_attn_metadata_wrapper(),
             build_draft_attn_metadata_factory(
-                self.input_buffers.positions, self.max_num_tokens, torch.from_numpy(self.input_batch.is_prefilling_np)
+                self.input_buffers.positions,
+                self.max_num_tokens,
+                torch.from_numpy(self.input_batch.is_prefilling_np),
+                num_query_per_req=self.num_query_per_req,
+                num_actual_reqs=input_batch.num_reqs,
             ),
         ):
             return super().propose(

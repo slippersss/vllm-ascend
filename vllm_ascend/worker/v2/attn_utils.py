@@ -231,6 +231,22 @@ def build_attn_metadata(
     if num_actual_reqs is None:
         num_actual_reqs = num_reqs
 
+    # The DSpark speculator CUDA-graph capture path (upstream
+    # ``_prepare_dflash_inputs_to_capture``) does not forward rotary positions,
+    # while Ascend backends (DSA/MLA/SFA) need ``positions`` to seed their
+    # static RoPE cos/sin buffers. ``positions`` is consumed only on the host,
+    # while the graph is being captured, to shape those buffers; the captured
+    # graph itself neither reads nor updates the ``positions`` tensor, and the
+    # cos/sin buffers (not ``positions``) are what the attention kernels read.
+    # On every replay the metadata is rebuilt with the real positions (the
+    # DSpark speculator forwards ``input_buffers.positions`` via
+    # ``build_draft_attn_metadata_factory``), which rewrites those buffers, so
+    # the zero values here only ever shape the buffers at capture time.
+    if positions is None:
+        if not for_cudagraph_capture:
+            raise ValueError("positions must be provided outside cudagraph capture")
+        positions = torch.zeros(num_input_tokens, dtype=torch.int64, device=query_start_loc_gpu.device)
+
     attn_metadata: dict[str, Any] = {}
     # Share request-level DSA metadata across cache groups in one execution.
     common_ratio_to_sas_metadata: dict[Any, Any] = {}
@@ -922,7 +938,14 @@ def build_attn_metadata_wrapper():
 
 
 @contextmanager
-def build_draft_attn_metadata_factory(positions, pad, is_prefilling):
+def build_draft_attn_metadata_factory(
+    positions,
+    pad,
+    is_prefilling,
+    *,
+    num_query_per_req: int | None = None,
+    num_actual_reqs: int | None = None,
+):
     """Wrap build_attn_metadata to forward rotary positions for the draft block.
 
     The generic (Ascend) ``build_attn_metadata`` reads ``positions`` inside the
@@ -933,6 +956,19 @@ def build_draft_attn_metadata_factory(positions, pad, is_prefilling):
     raw = _BUILD_ATTN_METADATA_MODULE.build_attn_metadata  # cache
 
     def build_attn_metadata(*args, **kwargs):
+        # Upstream intentionally clamps draft query offsets after the real
+        # request count. Ascend FULL graphs execute every padded draft row, so
+        # FIA requires those rows to form complete, uniform requests instead.
+        # Rewrite both host and device views before any Ascend metadata builder
+        # (notably DSA's SAS metadata operator) consumes them.
+        if num_query_per_req is not None:
+            num_reqs_padded = kwargs["num_reqs"]
+            query_start_loc_gpu = kwargs["query_start_loc_gpu"]
+            query_start_loc_cpu = torch.arange(num_reqs_padded + 1, dtype=torch.int32) * num_query_per_req
+            query_start_loc_gpu[: num_reqs_padded + 1].copy_(query_start_loc_cpu.to(query_start_loc_gpu.device))
+            kwargs["query_start_loc_cpu"] = query_start_loc_cpu
+        if num_actual_reqs is not None:
+            kwargs["num_actual_reqs"] = num_actual_reqs
         kwargs["positions"] = positions[:pad]
         kwargs["is_prefilling"] = is_prefilling
         return raw(*args, **kwargs)

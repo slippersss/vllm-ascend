@@ -529,3 +529,42 @@ def test_build_attn_metadata_propagates_prefill_state():
     )
 
     assert metadata["layer.0"] is is_prefilling
+
+
+def test_build_attn_metadata_requires_positions_outside_graph_capture():
+    with pytest.raises(ValueError, match="positions must be provided"):
+        attn_utils.build_attn_metadata(
+            attn_groups=[],
+            num_reqs=1,
+            num_tokens=1,
+            query_start_loc_gpu=torch.tensor([0, 1], dtype=torch.int32),
+            query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.int32),
+            max_query_len=1,
+            seq_lens=torch.tensor([1], dtype=torch.int32),
+            max_seq_len=1,
+            block_tables=(),
+            slot_mappings=(),
+            kv_cache_config=SimpleNamespace(kv_cache_groups=[]),
+            seq_lens_np=np.array([1], dtype=np.int32),
+        )
+
+
+def test_build_attn_metadata_supplies_capture_positions():
+    assert (
+        attn_utils.build_attn_metadata(
+            attn_groups=[],
+            num_reqs=1,
+            num_tokens=1,
+            query_start_loc_gpu=torch.tensor([0, 1], dtype=torch.int32),
+            query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.int32),
+            max_query_len=1,
+            seq_lens=torch.tensor([1], dtype=torch.int32),
+            max_seq_len=1,
+            block_tables=(),
+            slot_mappings=(),
+            kv_cache_config=SimpleNamespace(kv_cache_groups=[]),
+            seq_lens_np=np.array([1], dtype=np.int32),
+            for_cudagraph_capture=True,
+        )
+        == {}
+    )

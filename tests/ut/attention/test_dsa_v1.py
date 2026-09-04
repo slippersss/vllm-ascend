@@ -35,6 +35,7 @@ from vllm_ascend.attention.dsa_v1 import (
     AscendDSAMetadata,
     AscendDSAMetadataBuilder,
     AscendDSAReqMetadata,
+    build_dspark_swa_indices,
 )
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.device.device_op import DeviceOperator
@@ -98,6 +99,130 @@ def _make_builder(compressor_ratio: int = 4) -> AscendDSAMetadataBuilder:
     builder.seq_lens = torch.tensor([8, 6], dtype=torch.int32)
     builder.num_decodes = 2
     return builder
+
+
+@pytest.mark.parametrize(
+    ("method", "enabled", "expected"),
+    [
+        ("dspark", True, AttentionCGSupport.ALWAYS),
+        ("dspark", False, AttentionCGSupport.UNIFORM_BATCH),
+        ("eagle", True, AttentionCGSupport.UNIFORM_BATCH),
+    ],
+)
+def test_dsa_reports_varlen_graph_support_only_for_adaptive_dspark(
+    method,
+    enabled,
+    expected,
+):
+    vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(
+            method=method,
+            enable_adaptive_verification=enabled,
+        )
+    )
+
+    assert (
+        AscendDSAMetadataBuilder.get_cudagraph_support(
+            vllm_config,
+            cast(Any, None),
+        )
+        is expected
+    )
+
+
+def test_dspark_swa_indices_reuse_graph_buffer():
+    block_table = torch.arange(8, dtype=torch.int32).reshape(2, 4)
+    query_start_loc = torch.tensor([0, 2, 5], dtype=torch.int32)
+    seq_lens = torch.tensor([6, 9], dtype=torch.int32)
+    kwargs = {
+        "block_table": block_table,
+        "num_speculative_tokens": 3,
+        "window_size": 4,
+        "block_size": 4,
+        "query_start_loc": query_start_loc,
+        "seq_lens": seq_lens,
+        "num_decode_tokens": 5,
+        "index_width": 8,
+    }
+    expected_slots, expected_lens = build_dspark_swa_indices(**kwargs)
+    buffer = torch.empty((16, 1, 8), dtype=torch.int32)
+
+    actual_slots, actual_lens = build_dspark_swa_indices(
+        **kwargs,
+        buffer=buffer,
+    )
+
+    assert actual_slots.data_ptr() == buffer.data_ptr()
+    torch.testing.assert_close(actual_slots, expected_slots)
+    torch.testing.assert_close(actual_lens, expected_lens)
+
+
+def test_dspark_swa_indices_cover_full_graph_padding():
+    builder = _make_builder(compressor_ratio=1)
+    builder.speculative_config = SimpleNamespace(
+        num_speculative_tokens=10,
+        method="dspark",
+        enable_adaptive_verification=True,
+    )
+    builder.vllm_config.speculative_config = builder.speculative_config
+    builder.common_ratio_to_sas_metadata = {}
+    builder.num_actual_tokens = 6
+    builder.num_decode_tokens = 6
+    builder.num_decodes = 4
+    builder.num_prefills = 0
+    builder.seq_lens = torch.tensor([8, 8, 2, 2], dtype=torch.int32)
+    builder.block_table = torch.ones((4, 2), dtype=torch.int32)
+    builder.dspark_swa_indices_buffer = torch.zeros(
+        (16, 1, 4224),
+        dtype=torch.int32,
+    )
+    query_start_loc = torch.tensor([0, 2, 4, 6, 8], dtype=torch.int32)
+    common_attn_metadata = SimpleNamespace(
+        num_reqs=4,
+        num_input_tokens=8,
+        positions=torch.arange(8),
+        query_start_loc=query_start_loc,
+        query_start_loc_cpu=query_start_loc,
+        causal=False,
+    )
+    builder._build_sas_metadata = MagicMock(return_value=torch.zeros(DSA_METADATA_BUFFER_SIZE, dtype=torch.int32))
+    builder._build_qli_metadata = MagicMock(return_value=torch.zeros(DSA_METADATA_BUFFER_SIZE, dtype=torch.int32))
+    expected_indices = torch.zeros((8, 1, 4224), dtype=torch.int32)
+
+    with (
+        patch(
+            "vllm_ascend.attention.dsa_v1.build_dspark_swa_indices",
+            return_value=(expected_indices, torch.zeros(8, dtype=torch.int32)),
+        ) as build_indices,
+        patch.object(
+            DeviceOperator,
+            "get_dsa_decode_cu_seqlens_ori_kv",
+            return_value=torch.tensor([0, 8, 16, 18, 20], dtype=torch.int32),
+        ),
+        patch.object(
+            DeviceOperator,
+            "get_dsa_decode_cu_seqlens_cmp_kv",
+            return_value=torch.zeros(5, dtype=torch.int32),
+        ),
+        patch(
+            "vllm_ascend.attention.dsa_v1.get_dsa_attn_kv_plan",
+            return_value=_mock_dsa_kv_plan(
+                format_dsa_slot_mapping=torch.zeros((6, 2), dtype=torch.int32),
+            ),
+        ),
+    ):
+        metadata = builder.build_req_metadata(
+            common_attn_metadata=common_attn_metadata,
+            seq_lens_cpu=builder.seq_lens,
+            num_actual_reqs=2,
+            cos=torch.ones(8),
+            sin=torch.zeros(8),
+        )
+
+    assert build_indices.call_args.args[6] == common_attn_metadata.num_input_tokens
+    assert metadata.dspark_swa_indices is expected_indices
+    assert builder._build_sas_metadata.call_args.kwargs["max_seqlen_q"] == 11
+    assert builder._build_qli_metadata.call_args.kwargs["max_seqlen_q"] == 11
 
 
 @pytest.mark.parametrize(

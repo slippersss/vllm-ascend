@@ -42,6 +42,10 @@ from vllm.v1.worker.gpu.model_runner import (
     GPUModelRunner,
     sort_batch_req_ids,
 )
+from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
+    AdaptiveVerificationManager,
+    _assign_draft_token_budget,
+)
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import (
@@ -100,6 +104,74 @@ def _use_ascend_pcp_manager_for_vllm_0271():
         yield
     finally:
         pcp_module.PCPManager = original_pcp_manager_cls
+
+
+class AscendAdaptiveVerificationManager(AdaptiveVerificationManager):
+    """Run adaptive device-side reallocation safely on Ascend.
+
+    Keep the upstream allocation algorithm, but use its eager ranking function.
+    The dynamically compiled top-k path can corrupt capacities on Ascend when
+    it trims the draft budget.
+    """
+
+    def reallocate_drafts(
+        self,
+        req_ids: list[str],
+        idx_mapping: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, int]:
+        batch_budget, self._batch_budget = self._batch_budget, None
+        assert batch_budget is not None
+        num_drafts_per_req, num_non_draft_tokens_per_req, draft_budget = batch_budget
+        num_reqs = idx_mapping.shape[0]
+        scheduled_drafts = np.fromiter(
+            (num_drafts_per_req[req_id] for req_id in req_ids),
+            dtype=np.int32,
+            count=num_reqs,
+        )
+        num_non_draft_tokens = np.fromiter(
+            (num_non_draft_tokens_per_req[req_id] for req_id in req_ids),
+            dtype=np.int32,
+            count=num_reqs,
+        )
+        num_tokens = int(num_non_draft_tokens.sum()) + draft_budget
+
+        capacities = self._batch_draft_capacity[:num_reqs]
+        if draft_budget == 0:
+            capacities.zero_()
+        else:
+            async_copy_to_gpu(scheduled_drafts, out=capacities)
+            if draft_budget < int(scheduled_drafts.sum()):
+                _assign_draft_token_budget(
+                    self._confidence_probs,
+                    idx_mapping,
+                    capacities,
+                    draft_budget,
+                    self.num_speculative_steps,
+                )
+
+        num_non_draft_tokens_gpu = self._num_non_draft_tokens[:num_reqs]
+        async_copy_to_gpu(
+            num_non_draft_tokens,
+            out=num_non_draft_tokens_gpu,
+        )
+        self._cu_num_logits[:1].zero_()
+        torch.cumsum(
+            capacities + self.num_bonus_tokens,
+            dim=0,
+            out=self._cu_num_logits[1 : num_reqs + 1],
+        )
+        self.query_start_loc[:1].zero_()
+        torch.cumsum(
+            capacities + num_non_draft_tokens_gpu,
+            dim=0,
+            out=self.query_start_loc[1 : num_reqs + 1],
+        )
+        self.query_start_loc[num_reqs + 1 :].fill_(num_tokens)
+        return (
+            self._cu_num_logits[: num_reqs + 1],
+            self.query_start_loc,
+            draft_budget,
+        )
 
 
 class NPUModelRunner(GPUModelRunner):
@@ -264,6 +336,11 @@ class NPUModelRunner(GPUModelRunner):
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         with graph_manager_wrapper(self), _use_ascend_pcp_manager_for_vllm_0271():
             super().initialize_kv_cache(kv_cache_config)
+            if self.adaptive_verification is not None:
+                # The upstream factory has already performed backend support
+                # validation and initialized all state. The Ascend subclass has
+                # the same layout and changes only the ranking execution mode.
+                self.adaptive_verification.__class__ = AscendAdaptiveVerificationManager
             if self.pcp_manager is not None:
                 assert isinstance(self.pcp_manager, AscendPCPManager)
                 self.pcp_manager.vllm_config = self.vllm_config
@@ -624,7 +701,15 @@ class NPUModelRunner(GPUModelRunner):
                 np.cumsum(num_logits, out=cu_num_logits_np[1:])
                 cu_num_logits = async_copy_to_gpu(cu_num_logits_np, device=self.device)
 
+            adaptive_verification = self.adaptive_verification if num_draft_tokens_per_req is not None else None
             num_scheduled_tokens_upper_bound = num_scheduled_tokens_np
+            if adaptive_verification is not None:
+                num_scheduled_tokens_np, cu_num_logits_np = adaptive_verification.compact_batch(
+                    num_draft_tokens_per_req,
+                    num_scheduled_tokens_np,
+                    cu_num_logits_np,
+                )
+
             # Get query_start_loc.
             # NOTE: For FULL mode we change +1 to +2 to reserve extra space for padding.
             # See _pad_query_start_loc_for_fia.
@@ -638,18 +723,41 @@ class NPUModelRunner(GPUModelRunner):
 
             if batch_desc.cg_mode == CUDAGraphMode.FULL:
                 # This is only required for vllm-ascend.
-                query_start_loc_np, num_reqs_padded = self._pad_query_start_loc_for_fia(
-                    num_tokens_after_padding,
-                    num_reqs_padded,
-                    num_reqs,
-                    query_start_loc_np,
-                    batch_desc.cg_mode,
-                    batch_desc.num_reqs,
-                )
+                # Varlen FULL graphs are enabled for the whole adaptive
+                # verification request lifecycle. This includes short
+                # prefills before the draft model has produced any tokens.
+                if self.adaptive_verification is not None:
+                    query_start_loc_np, num_reqs_padded = self._pad_adaptive_query_start_loc_for_fia(
+                        num_tokens_after_padding,
+                        num_reqs_padded,
+                        num_reqs,
+                        query_start_loc_np,
+                    )
+                else:
+                    query_start_loc_np, num_reqs_padded = self._pad_query_start_loc_for_fia(
+                        num_tokens_after_padding,
+                        num_reqs_padded,
+                        num_reqs,
+                        query_start_loc_np,
+                        batch_desc.cg_mode,
+                        batch_desc.num_reqs,
+                    )
 
             query_start_loc = self.input_buffers.query_start_loc
-            async_copy_to_gpu(query_start_loc_np, out=query_start_loc)
+            if adaptive_verification is None:
+                async_copy_to_gpu(query_start_loc_np, out=query_start_loc)
 
+            if adaptive_verification is not None:
+                cu_num_logits, query_start_loc, total_num_draft_tokens = adaptive_verification.reallocate_drafts(
+                    req_ids, idx_mapping
+                )
+                total_num_logits = num_reqs * num_bonus_tokens + total_num_draft_tokens
+                if batch_desc.cg_mode == CUDAGraphMode.FULL:
+                    padding_start = num_reqs + 1 if num_reqs_padded > num_reqs else num_reqs
+                    async_copy_to_gpu(
+                        query_start_loc_np[padding_start : num_reqs_padded + 1],
+                        out=query_start_loc[padding_start : num_reqs_padded + 1],
+                    )
             if draft_tokens:
                 expanded_idx_mapping, expanded_local_pos = expand_idx_mapping(
                     idx_mapping, total_num_logits, cu_num_logits, self.decode_query_len
@@ -679,6 +787,13 @@ class NPUModelRunner(GPUModelRunner):
                 self.input_buffers.positions,
                 self.input_buffers.seq_lens,
             )
+            if num_reqs_padded > num_reqs:
+                dummy_seq_lens_np = np.diff(query_start_loc_np[num_reqs : num_reqs_padded + 1])
+                self.input_buffers.seq_lens_np[num_reqs:num_reqs_padded] = dummy_seq_lens_np
+                async_copy_to_gpu(
+                    dummy_seq_lens_np,
+                    out=self.input_buffers.seq_lens[num_reqs:num_reqs_padded],
+                )
             seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
 
             # Pad for full CUDA graph mode.
@@ -765,6 +880,9 @@ class NPUModelRunner(GPUModelRunner):
                 has_structured_output_reqs=scheduler_output.has_structured_output_requests,
                 # TODO: only populated for R-SWA (not supported yet).
                 prompt_lens=prompt_lens,
+                max_query_len=(
+                    int(num_scheduled_tokens_upper_bound.max()) if adaptive_verification is not None else None
+                ),
                 # extra attributes for ascend npus.
                 seq_lens_np=self.input_buffers.seq_lens_np,
                 attn_state=attn_state,
@@ -977,6 +1095,34 @@ class NPUModelRunner(GPUModelRunner):
             query_start_loc_np[num_reqs_padded + 1] = num_tokens_padded
             num_reqs_padded = num_reqs_padded + 1
 
+        return query_start_loc_np, num_reqs_padded
+
+    def _pad_adaptive_query_start_loc_for_fia(
+        self,
+        num_tokens_padded: int,
+        num_reqs_padded: int,
+        num_reqs: int,
+        query_start_loc_np: np.ndarray,
+    ) -> tuple[np.ndarray, int]:
+        """Make the final FIA query offset match the graph token count.
+
+        Adaptive verification produces variable per-request query lengths. Use
+        all request slots from the selected varlen graph descriptor and spread
+        graph-only tokens across its dummy requests. When there is no dummy
+        request slot, extend the final request across graph padding. Padded
+        tokens use an invalid slot mapping and do not write to the KV cache.
+        """
+        assert num_reqs <= num_reqs_padded <= self.max_num_reqs
+        num_padding_reqs = num_reqs_padded - num_reqs
+        if num_padding_reqs == 0:
+            query_start_loc_np[num_reqs] = num_tokens_padded
+            return query_start_loc_np, num_reqs_padded
+
+        last_loc = int(query_start_loc_np[num_reqs])
+        num_padding_tokens = num_tokens_padded - last_loc
+        assert num_padding_tokens >= 0
+        cumulative_padding = np.arange(1, num_padding_reqs + 1, dtype=np.int32) * num_padding_tokens // num_padding_reqs
+        query_start_loc_np[num_reqs + 1 : num_reqs_padded + 1] = last_loc + cumulative_padding
         return query_start_loc_np, num_reqs_padded
 
 

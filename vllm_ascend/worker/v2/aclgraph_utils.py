@@ -285,6 +285,27 @@ class ModelWithContext(nn.Module):
     def markov_bias(self, markov_embed: torch.Tensor):
         return self.original_model.markov_bias(markov_embed)
 
+    def apply_markov_bias_gathered(
+        self,
+        markov_embed: torch.Tensor,
+        base_logits: torch.Tensor,
+        base_values: torch.Tensor,
+        draft_indices: torch.Tensor,
+    ):
+        return self.original_model.apply_markov_bias_gathered(
+            markov_embed,
+            base_logits,
+            base_values,
+            draft_indices,
+        )
+
+    def compute_confidence(
+        self,
+        head_hidden: torch.Tensor,
+        markov_embed: torch.Tensor,
+    ):
+        return self.original_model.compute_confidence(head_hidden, markov_embed)
+
     def map_draft_to_target(self, draft_ids: torch.Tensor):
         return self.original_model.map_draft_to_target(draft_ids)
 

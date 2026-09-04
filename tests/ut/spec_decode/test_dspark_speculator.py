@@ -26,6 +26,7 @@ import pytest
 import torch
 from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
 
+from vllm_ascend.worker.v2 import attn_utils
 from vllm_ascend.worker.v2.spec_decode.dspark.speculator import (
     AscendDSparkSpeculator,
 )
@@ -98,3 +99,42 @@ class TestLoadDraftModel:
         monkeypatch.setattr(_ROT_MATRIX, _no_call)
         draft = _spec(_bf16_config()).load_draft_model(MagicMock(), set())
         assert torch.equal(draft.model.fc.weight.data, captured["before"])
+
+
+def test_draft_metadata_factory_restores_full_padded_query_layout(monkeypatch):
+    captured = {}
+
+    def build_attn_metadata(*args, **kwargs):
+        captured.update(kwargs)
+        return "metadata"
+
+    monkeypatch.setattr(
+        attn_utils._BUILD_ATTN_METADATA_MODULE,
+        "build_attn_metadata",
+        build_attn_metadata,
+    )
+    query_start_loc_gpu = torch.tensor([0, 10, 20, 30, 30], dtype=torch.int32)
+
+    with attn_utils.build_draft_attn_metadata_factory(
+        positions=torch.arange(40),
+        pad=40,
+        is_prefilling=torch.zeros(4, dtype=torch.bool),
+        num_query_per_req=10,
+        num_actual_reqs=3,
+    ):
+        result = attn_utils._BUILD_ATTN_METADATA_MODULE.build_attn_metadata(
+            num_reqs=4,
+            query_start_loc_gpu=query_start_loc_gpu,
+            query_start_loc_cpu=torch.tensor([0, 10, 20, 30, 30]),
+        )
+
+    assert result == "metadata"
+    torch.testing.assert_close(
+        query_start_loc_gpu,
+        torch.tensor([0, 10, 20, 30, 40], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        captured["query_start_loc_cpu"],
+        torch.tensor([0, 10, 20, 30, 40], dtype=torch.int32),
+    )
+    assert captured["num_actual_reqs"] == 3
