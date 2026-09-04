@@ -537,6 +537,7 @@
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.sampling_params.SamplingParams._validate_structured_outputs`
 #      `vllm.v1.structured_output.StructuredOutputManager.grammar_init`
+#      `vllm.v1.structured_output.StructuredOutputManager.grammar_bitmask`
 #    Why:
 #       V1 structured outputs use one engine-level backend, while `backend=auto`
 #       resolves the backend per request. After one request initializes
@@ -546,10 +547,13 @@
 #       Record the first resolved backend on the structured-output config and
 #       reject later requests that resolve to a different backend. Also guard
 #       `grammar_init` so requests that bypass API-side validation fail before
-#       backend grammar compilation.
+#       backend grammar compilation. On vLLM v0.27.1 and v0.28.0 only, backport
+#       #53046 so post-boundary draft tokens are validated before accepting them
+#       into the grammar.
 #    Related PR (if no, explain why):
 #       https://github.com/vllm-project/vllm/issues/43920
 #       https://github.com/vllm-project/vllm/pull/44401
+#       https://github.com/vllm-project/vllm/pull/53046
 #    Future Plan:
 #       Remove this patch once upstream vLLM either enforces backend consistency
 #       before grammar compilation or safely handles mixed-backend grammar
